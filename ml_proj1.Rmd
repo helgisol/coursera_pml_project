@@ -1,0 +1,582 @@
+---
+title: "Detection of manner of barbell lifting by analysing accelerometer logging data"
+author: "Oleg Sémery"
+output: html_document
+---
+
+## Executive summary
+
+We have two tables:  
+1. https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv (training set).  
+2. https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv (test set).  
+These table contain data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants of an experiment. These people were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information about the experiment is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).  
+In this work we predict the manner in which a person did the exercise. This is the "classe" variable in the training set. Also we describe how we built our model, how we used cross validation, and so on. Finnaly we have chosen a random forest model with adaptive 10-fold cross-validation (accuracy is 0.995).
+
+## Loading and tidy data
+
+```{r load_libraries, echo=FALSE}
+library(knitr)
+suppressMessages(library(ggplot2, quietly = TRUE))
+suppressMessages(library(plyr, quietly = TRUE))
+suppressMessages(library(dplyr, quietly = TRUE))
+suppressMessages(library(caret, quietly = TRUE))
+suppressMessages(library(kernlab))
+suppressMessages(library(randomForest))
+suppressMessages(library(rpart))
+suppressMessages(library(nnet))
+suppressMessages(library(RRF))
+suppressMessages(library(C50))
+suppressMessages(library(gbm))
+#suppressMessages(library(obliqueRF))
+#suppressMessages(library(rotationForest))
+#suppressMessages(library(inTrees))
+suppressMessages(library(glmnet))
+#suppressMessages(library(hda))
+suppressMessages(library(MASS))
+#suppressMessages(library(klaR))
+suppressMessages(library(pls))
+suppressMessages(library(mda))
+suppressMessages(library(e1071))
+suppressMessages(library(Boruta))
+```
+
+We load the data:
+
+```{r data_load, echo=TRUE, cache=TRUE, autodep=TRUE}
+load_pml_table <- function(file_name)
+{
+  dir_name <- "D:/download/coursera/practical-machine-learning/projects/"
+  read.csv(paste0(dir_name, file_name), na.strings = c("NA", "#DIV/0!", ""))
+}
+pml_training <- load_pml_table("pml-training.csv")
+pml_testing <- load_pml_table("pml-testing.csv")
+```
+
+The training table has **`r ncol(pml_training)`** variables and **`r nrow(pml_training)`** obseravations. Then we should remove usless varibales. First of all we remove a column with indices: 
+
+```{r data_filtering1, echo=TRUE, cache=TRUE, autodep=TRUE}
+pml_training$X <- NULL
+```
+
+Then we remove all variables which contain too many NA values:
+
+```{r data_filtering2, echo=TRUE, cache=TRUE, autodep=TRUE}
+remove_na_flooded_vars <- function(data, col_nums, min_nna_rate = 0.1)
+{
+  refine_col <- function(var_name)
+  {
+    n <- nrow(data)
+    data[[var_name]] <- as.double(as.character(data[[var_name]]))
+    if (sum(!is.na(data[[var_name]]))/n < min_nna_rate)
+    {
+      data[[var_name]] <- NULL
+    }
+    data
+  }
+  data_names <- names(data)
+  for (i in col_nums)
+  {
+    data <- refine_col(data_names[i])
+  }
+  data
+}
+pml_training <- remove_na_flooded_vars(pml_training, 6:(ncol(pml_training)-1))
+```
+
+Now we have **`r ncol(pml_training)`** variables in the train dataset. Then we remove near zero-variance predictors:
+
+```{r data_filtering3, echo=TRUE, cache=TRUE, autodep=TRUE}
+pml_training <- pml_training[, -nearZeroVar(pml_training)]
+```
+
+After that we have **`r ncol(pml_training)`** variables in train table. Now we manually remove varibales which contains usless metainformation and the time stamps:
+
+
+```{r data_filtering4, echo=TRUE, cache=TRUE, autodep=TRUE}
+pml_training <- pml_training %>% dplyr::select(-c(user_name, raw_timestamp_part_1,raw_timestamp_part_2, cvtd_timestamp, num_window))
+```
+
+```{r missing_value_processing, echo=FALSE, cache=TRUE, autodep=TRUE}
+mis_values <- sum(is.na(pml_training))
+dup_observations <- nrow(pml_training) - nrow(unique( pml_training[,1:(ncol(pml_training)-1)] ))
+```
+
+Then we should process missing values in our data. Fortunately the current data doesn't contain missing values. So we skip this preprocessing step. Also we have determined that train data doesn't contain duplicated observations. It's goo too.
+
+```{r data_filtering5, echo=FALSE, cache=TRUE, autodep=TRUE}
+pml_training_cor <- cor(pml_training[1:(ncol(pml_training)-1)])
+#summary(pml_training_cor[upper.tri(pml_training_cor)])
+cutoff_value <- 0.9
+highly_cor_pml <- findCorrelation(pml_training_cor, cutoff = cutoff_value)
+highly_cor_pml_count <- length(highly_cor_pml)
+
+# pml_training_num_preds <- pml_training_num_preds[,-highlyCorDescr]
+# descrCor2 <- cor(pml_training_num_preds)
+# summary(descrCor2[upper.tri(descrCor2)])
+```
+
+```{r data_filtering6, echo=FALSE, cache=TRUE, autodep=TRUE}
+pca_thresh <- 0.95
+preProc <- preProcess(pml_training, method = "pca", thresh = pca_thresh)
+#preProc
+#preProc$numComp
+```
+
+As result the train dataset has only **`r ncol(pml_training)`** variables. Then we can remove **`r highly_cor_pml_count`** highly correlated variables (with **`r cutoff_value`** pair-wise absolute correlation cutoff), but on the other hand we also can remove **`r ncol(pml_training)-preProc$numComp`** predictors by using PCA preprocessing (if we want to capture **`r pca_thresh`** of the variance) during train procedure. Thus we can win in speed training (up to 30%), but it's at the expense of some loss of classification quality. On the other hand there is an urgent need to remove highly correlated variables for the most of considered classificator models (e.g. for support vector machines with radial basis function kernel or random forest).
+
+## Exploratory visualisations
+
+Now we can look at some diagnostic graphs:
+
+```{r train_data_visualizations, echo=FALSE, cache=TRUE, autodep=TRUE}
+featurePlot(x = pml_training[, 1:3], y = pml_training$classe, plot = "pairs", auto.key = list(columns = 3), main="Scatterplot Matrix")
+featurePlot(x = pml_training[, 1:3], y = pml_training$classe, plot = "density", scales = list(x = list(relation="free"), y = list(relation="free")), pch = "|", auto.key = list(columns = 3), main="Overlayed Density Plot")
+```
+
+## Splitting train data
+
+Since we are going to analyze the quality of trained classificators, we split train data onto real train data and testing one. We use balanced splitting on the outcome:
+
+```{r train_data_splitting, echo=TRUE, cache=TRUE, autodep=TRUE}
+set.seed(2345)
+train_inds <- createDataPartition(pml_training$classe, p = 0.9, list = FALSE)
+train_pml <- pml_training[train_inds,]
+test_pml <- pml_training[-train_inds,]
+```
+
+## Choosing the best model
+
+```{r train_prep_cv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_cv3 <- trainControl(method = "cv", number = 3)
+```
+
+```{r train_prep_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_acv3 <- trainControl(method = "adaptive_cv", number = 3, adaptive = list(min = 2, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_svml_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_svml_cv3_pca095 <- system.time(model_fit_svml_cv3_pca095 <- train(classe ~ ., data = train_pml, method = "svmLinear", preProcess = "pca", trControl = fit_control_cv3))
+```
+
+```{r train_svml2_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_svml2_acv3_pca095 <- system.time(model_fit_svml2_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "svmLinear2", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+```{r train_svmr_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_svmr_acv3_pca095 <- system.time(model_fit_svmr_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "svmRadial", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+```{r train_svmrw_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_svmrw_acv3_pca095 <- system.time(suppressWarnings(model_fit_svmrw_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "svmRadialWeights", preProcess = "pca", trControl = fit_control_acv3)))
+```
+
+```{r train_svmrc_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_svmrc_acv3_pca095 <- system.time(model_fit_svmrc_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "svmRadialCost", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+```{r train_svmrs_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_svmrs_acv3_pca095 <- system.time(model_fit_svmrs_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "svmRadialSigma", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+```{r train_rf_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_acv3_pca095 <- system.time(suppressWarnings(model_fit_rf_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "rf", preProcess = "pca", trControl = fit_control_acv3)))
+```
+
+```{r train_rpart_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rpart_acv3_pca095 <- system.time(model_fit_rpart_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "rpart", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+```{r train_rpart2_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rpart2_acv3_pca095 <- system.time(suppressWarnings(model_fit_rpart2_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "rpart2", preProcess = "pca", trControl = fit_control_acv3)))
+```
+
+```{r train_nnet_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_nnet_acv3_pca095 <- system.time(model_fit_nnet_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "nnet", preProcess = "pca", trControl = fit_control_acv3, trace = FALSE))
+```
+
+```{r train_gbm_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_gbm_acv3_pca095 <- system.time(suppressWarnings(model_fit_gbm_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "gbm", preProcess = "pca", trControl = fit_control_acv3, verbose = FALSE)))
+```
+
+```{r train_pls_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_pls_acv3_pca095 <- system.time(suppressWarnings(model_fit_pls_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "pls", preProcess = "pca", trControl = fit_control_acv3)))
+```
+
+```{r train_glmnet_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_glmnet_acv3_pca095 <- system.time(model_fit_glmnet_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "glmnet", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+```{r train_lda_cv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_lda_cv3_pca095 <- system.time(model_fit_lda_cv3_pca095 <- train(classe ~ ., data = train_pml, method = "lda", preProcess = "pca", trControl = fit_control_cv3))
+```
+
+```{r train_lda2_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_lda2_acv3_pca095 <- system.time(suppressWarnings(model_fit_lda2_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "lda2", preProcess = "pca", trControl = fit_control_acv3)))
+```
+
+```{r train_mda_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_mda_acv3_pca095 <- system.time(model_fit_mda_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "mda", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+```{r train_c50t_cv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_c50t_cv3_pca095 <- system.time(model_fit_c50t_cv3_pca095 <- train(classe ~ ., data = train_pml, method = "C5.0Tree", preProcess = "pca", trControl = fit_control_cv3, verbose = FALSE))
+```
+
+```{r train_c50r_cv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_c50r_cv3_pca095 <- system.time(model_fit_c50r_cv3_pca095 <- train(classe ~ ., data = train_pml, method = "C5.0Rules", preProcess = "pca", trControl = fit_control_cv3, verbose = FALSE))
+```
+
+```{r train_c50_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_c50_acv3_pca095 <- system.time(model_fit_c50_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "C5.0", preProcess = "pca", trControl = fit_control_acv3, verbose = FALSE))
+```
+
+```{r train_boruta_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_boruta_acv3_pca095 <- system.time(suppressWarnings(model_fit_boruta_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "Boruta", preProcess = "pca", trControl = fit_control_acv3, verbose = FALSE)))
+```
+
+```{r train_rrf_acv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rrf_acv3_pca095 <- system.time(model_fit_rrf_acv3_pca095 <- train(classe ~ ., data = train_pml, method = "RRF", preProcess = "pca", trControl = fit_control_acv3))
+```
+
+Now we are going to choose the best model of classificator for our training data (with PCA-preprocessing, PCA-threshold is **`r pca_thresh`**). We iterate through various models to achieve one with the best quality of classification. After training models we create a summary table with parameters of learning:
+
+```{r show_models1, echo=TRUE, cache=TRUE, autodep=TRUE}
+build_quality_matrix <- function(train_models)
+{
+  models <- lapply(train_models, function(x) x[[1]])
+  User.Time <- sapply(train_models, function(x) ifelse(class(x[[2]])=="proc_time", x[[2]][1], NA))
+  Sys.Time <- sapply(train_models, function(x) ifelse(class(x[[2]])=="proc_time", x[[2]][2], NA))
+  Model.Name <- sapply(models, function(x) x$method )
+  Resampling <- sapply(models, function(x) x$control$method )
+  Folds <- sapply(models, function(x) x$control$number )
+  Repeats <- sapply(models, function(x) x$control$repeats )
+  PCA <- sapply(models, function(x) !is.null(names(x$preProcess$method)) && "pca" %in% names(x$preProcess$method) )
+  Train.Accuracy <- sapply(models, function(x)
+    ifelse(x$control$method %in% c("oob"), NA, sum(diag(confusionMatrix(x)$table))/100) )
+  conf_matrices <- lapply(models, function(x) confusionMatrix(predict(x, newdata = test_pml), test_pml$classe) )
+  Accuracy <- sapply(conf_matrices, function(x) as.numeric(x$overall["Accuracy"]) )
+  Kappa <- sapply(conf_matrices, function(x) as.numeric(x$overall["Kappa"]) )
+  data.frame(Model.Name, Train.Accuracy, Accuracy, Kappa, Resampling, Folds, Repeats, PCA, User.Time, Sys.Time) %>%
+    arrange(desc(Accuracy), desc(Kappa), desc(Train.Accuracy))
+}
+models <- list(
+  list(model_fit_svml_cv3_pca095, time_svml_cv3_pca095),
+  list(model_fit_svml2_acv3_pca095, time_svml2_acv3_pca095),
+  list(model_fit_svmr_acv3_pca095, time_svmr_acv3_pca095),
+  list(model_fit_svmrw_acv3_pca095, time_svmrw_acv3_pca095),
+  list(model_fit_svmrc_acv3_pca095, time_svmrc_acv3_pca095),
+  list(model_fit_svmrs_acv3_pca095, time_svmrs_acv3_pca095),
+  list(model_fit_rf_acv3_pca095, time_rf_acv3_pca095),
+  list(model_fit_rrf_acv3_pca095, time_rrf_acv3_pca095),
+  list(model_fit_c50_acv3_pca095, time_c50_acv3_pca095),
+  list(model_fit_c50t_cv3_pca095, time_c50t_cv3_pca095),
+  list(model_fit_c50r_cv3_pca095, time_c50r_cv3_pca095),
+  list(model_fit_boruta_acv3_pca095, time_boruta_acv3_pca095),
+  list(model_fit_rpart_acv3_pca095, time_rpart_acv3_pca095),
+  list(model_fit_rpart2_acv3_pca095, time_rpart2_acv3_pca095),
+  list(model_fit_nnet_acv3_pca095, time_nnet_acv3_pca095),
+  list(model_fit_gbm_acv3_pca095, time_gbm_acv3_pca095),
+  list(model_fit_pls_acv3_pca095, time_pls_acv3_pca095),
+  list(model_fit_glmnet_acv3_pca095, time_glmnet_acv3_pca095),
+  list(model_fit_lda_cv3_pca095, time_lda_cv3_pca095),
+  list(model_fit_lda2_acv3_pca095, time_lda2_acv3_pca095),
+  list(model_fit_mda_acv3_pca095, time_mda_acv3_pca095))
+kable(build_quality_matrix(models))
+```
+
+Comparison of the three best models:
+
+```{r compare_best_models, echo=FALSE, cache=TRUE, autodep=TRUE}
+resamps <- resamples(list(RF = model_fit_rf_acv3_pca095,
+                          Boruta = model_fit_boruta_acv3_pca095,
+                          C50 = model_fit_c50_acv3_pca095))
+bwplot(resamps)
+```
+
+We see that the best method among the considered ones is a Boryra model. This is in terms of the quality of classification. But considering also the speed of learning we choose a random forest model.
+
+## Choosing the best preprocessing and rersampling methods
+
+```{r train_prep_rcv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_rcv3 <- trainControl(method = "repeatedcv", number = 3, repeats = 3)
+```
+
+```{r train_rf_cv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_cv3_pca095 <- system.time(suppressWarnings(model_fit_rf_cv3_pca095 <- train(classe ~ ., data = train_pml, method = "rf", preProcess = "pca", trControl = fit_control_cv3)))
+```
+
+```{r train_prep_arcv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_arcv3 <- trainControl(method = "adaptive_cv", number = 3, repeats = 3, adaptive = list(min = 2, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_b3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_b3 <- trainControl(method = "boot", number = 3, repeats = 3)
+```
+
+```{r train_prep_ab3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_ab3 <- trainControl(method = "adaptive_boot", number = 3, repeats = 3, adaptive = list(min = 2, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_lgocv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_lgocv3 <- trainControl(method = "LGOCV", number = 3, repeats = 3)
+```
+
+```{r train_prep_algocv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_algocv3 <- trainControl(method = "adaptive_LGOCV", number = 3, repeats = 3, adaptive = list(min = 2, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_oob3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_oob3 <- trainControl(method = "oob", number = 3)
+```
+
+
+```{r train_rf_rcv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_rcv3_pca095 <- system.time(suppressWarnings(model_fit_rf_rcv3_pca095 <- train(classe ~ ., data = train_pml, method = "rf", preProcess = "pca", trControl = fit_control_rcv3)))
+```
+
+```{r train_rf_arcv3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_arcv3_pca095 <- system.time(suppressWarnings(model_fit_rf_arcv3_pca095 <- train(classe ~ ., data = train_pml, method = "rf", preProcess = "pca", trControl = fit_control_arcv3)))
+```
+
+```{r train_rf_b3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_b3_pca095 <- system.time(suppressWarnings(model_fit_rf_b3_pca095 <- train(classe ~ ., data = train_pml, method = "rf", preProcess = "pca", trControl = fit_control_b3)))
+```
+
+```{r train_rf_ab3_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_ab3_pca095 <- system.time(suppressWarnings(model_fit_rf_ab3_pca095 <- train(classe ~ ., data = train_pml, method = "rf", preProcess = "pca", trControl = fit_control_ab3)))
+```
+
+
+```{r train_rf_cv3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_cv3 <- system.time(suppressWarnings(model_fit_rf_cv3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_cv3)))
+```
+
+```{r train_rf_rcv3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_rcv3 <- system.time(suppressWarnings(model_fit_rf_rcv3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_rcv3)))
+```
+
+```{r train_rf_acv3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_acv3 <- system.time(suppressWarnings(model_fit_rf_acv3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_acv3)))
+```
+
+```{r train_rf_arcv3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_arcv3 <- system.time(suppressWarnings(model_fit_rf_arcv3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_arcv3)))
+```
+
+```{r train_rf_b3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_b3 <- system.time(suppressWarnings(model_fit_rf_b3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_b3)))
+```
+
+```{r train_rf_ab3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_ab3 <- system.time(suppressWarnings(model_fit_rf_ab3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_ab3)))
+```
+
+```{r train_rf_lgocv3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_lgocv3 <- system.time(suppressWarnings(model_fit_rf_lgocv3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_lgocv3)))
+```
+
+```{r train_rf_algocv3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_algocv3 <- system.time(suppressWarnings(model_fit_rf_algocv3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_algocv3)))
+```
+
+```{r train_rf_oob3, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_oob3 <- system.time(suppressWarnings(model_fit_rf_oob3 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_oob3)))
+```
+
+
+```{r train_prep_cv5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_cv5 <- trainControl(method = "cv", number = 5)
+```
+
+```{r train_prep_rcv5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_rcv5 <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+```
+
+```{r train_prep_acv5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_acv5 <- trainControl(method = "adaptive_cv", number = 5, adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_arcv5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_arcv5 <- trainControl(method = "adaptive_cv", number = 5, repeats = 5, adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_b5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_b5 <- trainControl(method = "boot", number = 5, repeats = 5)
+```
+
+```{r train_prep_ab5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_ab5 <- trainControl(method = "adaptive_boot", number = 5, repeats = 5, adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_lgocv5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_lgocv5 <- trainControl(method = "LGOCV", number = 5, repeats = 5)
+```
+
+```{r train_prep_algocv5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_algocv5 <- trainControl(method = "adaptive_LGOCV", number = 5, repeats = 5, adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_oob5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_oob5 <- trainControl(method = "oob", number = 5)
+```
+
+```{r train_rf_cv5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_cv5 <- system.time(suppressWarnings(model_fit_rf_cv5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_cv5)))
+```
+
+```{r train_rf_rcv5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_rcv5 <- system.time(suppressWarnings(model_fit_rf_rcv5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_rcv5)))
+```
+
+```{r train_rf_acv5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_acv5 <- system.time(suppressWarnings(model_fit_rf_acv5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_acv5)))
+```
+
+```{r train_rf_arcv5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_arcv5 <- system.time(suppressWarnings(model_fit_rf_arcv5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_arcv5)))
+```
+
+
+```{r train_rf_b5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_b5 <- system.time(suppressWarnings(model_fit_rf_b5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_b5)))
+```
+
+```{r train_rf_ab5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_ab5 <- system.time(suppressWarnings(model_fit_rf_ab5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_ab5)))
+```
+
+```{r train_rf_lgocv5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_lgocv5 <- system.time(suppressWarnings(model_fit_rf_lgocv5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_lgocv5)))
+```
+
+```{r train_rf_algocv5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_algocv5 <- system.time(suppressWarnings(model_fit_rf_algocv5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_algocv5)))
+```
+
+```{r train_rf_oob5, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_oob5 <- system.time(suppressWarnings(model_fit_rf_oob5 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_oob5)))
+```
+
+```{r train_rf_oob5_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_oob5_pca095 <- system.time(suppressWarnings(model_fit_rf_oob5_pca095 <- train(classe ~ ., data = train_pml, method = "rf", preProcess = "pca", trControl = fit_control_oob5)))
+```
+
+
+```{r train_prep_acv4_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_acv4 <- trainControl(method = "adaptive_cv", number = 4, adaptive = list(min = 3, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_acv7_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_acv7 <- trainControl(method = "adaptive_cv", number = 7, adaptive = list(min = 4, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+```{r train_prep_acv10_pca095, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_acv10 <- trainControl(method = "adaptive_cv", number = 10, adaptive = list(min = 6, alpha = 0.05, method = "gls", complete = TRUE))
+```
+
+
+```{r train_rf_acv4, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_acv4 <- system.time(suppressWarnings(model_fit_rf_acv4 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_acv4)))
+```
+
+```{r train_rf_acv7, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_acv7 <- system.time(suppressWarnings(model_fit_rf_acv7 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_acv7)))
+```
+
+```{r train_rf_acv10, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_acv10 <- system.time(suppressWarnings(model_fit_rf_acv10 <- train(classe ~ ., data = train_pml, method = "rf", trControl = fit_control_acv10)))
+```
+
+Now we iterate through various parameters of the random forest model to achieve the best quality of classification. All results are in the following summary table:
+
+```{r show_models2, echo=FALSE, cache=TRUE, autodep=TRUE}
+models <- list(
+  list(model_fit_rf_cv3_pca095, time_rf_cv3_pca095),
+  list(model_fit_rf_rcv3_pca095, time_rf_rcv3_pca095),
+  list(model_fit_rf_acv3_pca095, time_rf_acv3_pca095),
+  list(model_fit_rf_arcv3_pca095, time_rf_arcv3_pca095),
+  list(model_fit_rf_b3_pca095, time_rf_b3_pca095),
+  list(model_fit_rf_ab3_pca095, time_rf_ab3_pca095),
+  list(model_fit_rf_cv3, time_rf_cv3),
+  list(model_fit_rf_rcv3, time_rf_rcv3),
+  list(model_fit_rf_acv3, time_rf_acv3),
+  list(model_fit_rf_arcv3, time_rf_arcv3),
+  list(model_fit_rf_b3, time_rf_b3),
+  list(model_fit_rf_ab3, time_rf_ab3),
+  list(model_fit_rf_lgocv3, time_rf_lgocv3),
+  list(model_fit_rf_algocv3, time_rf_algocv3),
+  list(model_fit_rf_oob3, time_rf_oob3),
+  list(model_fit_rf_oob5_pca095, time_rf_oob5_pca095),
+  list(model_fit_rf_cv5, time_rf_cv5),
+  list(model_fit_rf_rcv5, time_rf_rcv5),
+  list(model_fit_rf_acv5, time_rf_acv5),
+  list(model_fit_rf_arcv5, time_rf_arcv5),
+  list(model_fit_rf_b5, time_rf_b5),
+  list(model_fit_rf_ab5, time_rf_ab5),
+  list(model_fit_rf_lgocv5, time_rf_lgocv5),
+  list(model_fit_rf_algocv5, time_rf_algocv5),
+  list(model_fit_rf_oob5, time_rf_oob5),
+  list(model_fit_rf_acv4, time_rf_acv4),
+  list(model_fit_rf_acv7, time_rf_acv7),
+  list(model_fit_rf_acv10, time_rf_acv10))
+kable(build_quality_matrix(models))
+```
+
+Now we choose the best parameters for learning random forest model:  
+1. working with raw data without PCA-preprocessing,  
+2. using adaptive 10-fold cross-validation without repeats.
+
+## Analysis of the selected model
+
+Detail information about the model learning:
+
+```{r predict_test1, echo=TRUE, cache=TRUE, autodep=TRUE}
+model_fit_final <- model_fit_rf_acv10; model_fit_final
+confusionMatrix(model_fit_final)
+suppressWarnings(ggplot(model_fit_final) + ggtitle("Accuracy for different mtry"))
+```
+
+Detail information about the model testing:
+
+```{r predict_test2, echo=TRUE, cache=TRUE, autodep=TRUE}
+confusionMatrix(predict(model_fit_final, newdata = test_pml), test_pml$classe)
+```
+
+More performance statistics for our multi-class problem:
+
+```{r predict_test3, echo=FALSE, cache=TRUE, autodep=TRUE}
+test_results <- predict(model_fit_final, test_pml, type = "prob")
+test_results$obs <- test_pml$classe
+test_results$pred <- predict(model_fit_final, test_pml)
+kable(multiClassSummary(test_results, lev = levels(test_results$obs)))
+```
+
+```{r train_prep_acv10_pca095_cp, echo=FALSE, cache=TRUE, autodep=TRUE}
+fit_control_acv10_cp <- trainControl(method = "adaptive_cv", number = 10, adaptive = list(min = 6, alpha = 0.05, method = "gls", complete = TRUE), classProbs = TRUE, summaryFunction = multiClassSummary)
+```
+
+```{r train_rf_acv10_cp, echo=FALSE, cache=TRUE, autodep=TRUE}
+time_rf_acv10_cp <- system.time(suppressWarnings(model_fit_rf_acv10_cp <- train(classe ~ ., data = train_pml, method = "rf", metric = "ROC", tuneLength = 20, trControl = fit_control_acv10_cp)))
+```
+
+```{r predict_test5, echo=FALSE, cache=TRUE, autodep=TRUE}
+suppressWarnings(ggplot(model_fit_rf_acv10_cp) +
+  geom_smooth(se = FALSE, span = .8, method = loess) +
+  theme(legend.position = "top") + ggtitle("Dependence of logLoss on mtry"))
+```
+
+```{r predict_test4, echo=FALSE, cache=TRUE, autodep=TRUE}
+var_imp <- varImp(model_fit_final)
+plot(var_imp, top = 20, main="Variable importance analisys")
+```
+
+## Resulting predict
+
+Finally we can apply our model for test data set:
+
+```{r resulting predict, echo=TRUE, cache=TRUE, autodep=TRUE}
+test_predictions <- pml_testing %>% dplyr::select(X, user_name)
+test_predictions$prediction <- predict(model_fit_rf_acv3, newdata = pml_testing)
+kable(test_predictions)
+```
+
